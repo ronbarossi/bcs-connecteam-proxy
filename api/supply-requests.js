@@ -1,24 +1,20 @@
-// Vercel Serverless Function — proxies the two Connecteam "Supplies Workflows"
+// Vercel Serverless Function — proxies the Connecteam "Supplies Workflows"
 // forms (Supply Request + Requerimiento Material de Trabajo) for Launchpad.
-// Mirrors the auth/util pattern of the time-activities handler.
+// v2: diagnostics + lenient form-name matching.
 
 const CONNECTEAM_API = 'https://api.connecteam.com';
 const API_KEY = process.env.CONNECTEAM_API_KEY;
-
-// Matched by name (case-insensitive). Add/adjust names here if they change.
 const TARGET_FORMS = ['Supply Request', 'Requerimiento Material de Trabajo'];
+const norm = (s) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
 async function connecteamFetch(path, params = {}) {
   const url = new URL(`${CONNECTEAM_API}${path}`);
   Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v); });
-  const res = await fetch(url.toString(), {
-    headers: { 'X-API-KEY': API_KEY, 'Content-Type': 'application/json' },
-  });
-  if (!res.ok) { const t = await res.text(); throw new Error(`Connecteam API ${res.status}: ${t}`); }
+  const res = await fetch(url.toString(), { headers: { 'X-API-KEY': API_KEY, 'Content-Type': 'application/json' } });
+  if (!res.ok) { const t = await res.text(); throw new Error(`${res.status}: ${t.slice(0, 200)}`); }
   return res.json();
 }
 
-// Flatten a Connecteam answer value across the shapes it might use.
 function answerValue(a) {
   const v = a?.value ?? a?.answer ?? a?.text ?? a?.values ?? a?.selectedOptions ?? a?.options ?? a?.attachments;
   if (v == null) return '';
@@ -37,17 +33,32 @@ export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
   if (!API_KEY) return res.status(500).json({ error: 'CONNECTEAM_API_KEY not configured' });
 
+  const debug = {};
   try {
     const { days = '14' } = req.query;
     const sinceMs = Date.now() - parseInt(days, 10) * 86400000;
 
-    // 1) List forms, match our two by name.
-    const formsRes = await connecteamFetch('/forms/v1/forms', { limit: 200, offset: 0 });
-    const allForms = formsRes?.data?.forms || formsRes?.data || [];
-    const wanted = (Array.isArray(allForms) ? allForms : []).filter(f =>
-      TARGET_FORMS.some(t => (f.name || f.title || '').trim().toLowerCase() === t.toLowerCase()));
+    // 1) List forms — capture raw shape for diagnosis.
+    let allForms = [];
+    try {
+      const formsRes = await connecteamFetch('/forms/v1/forms', { limit: 200, offset: 0 });
+      debug.formsTopKeys = Object.keys(formsRes || {});
+      debug.formsDataKeys = formsRes?.data ? Object.keys(formsRes.data) : null;
+      allForms = formsRes?.data?.forms || formsRes?.data?.formsList || (Array.isArray(formsRes?.data) ? formsRes.data : []) || [];
+      debug.formCount = Array.isArray(allForms) ? allForms.length : 0;
+      debug.allFormNames = (Array.isArray(allForms) ? allForms : []).map(f => f.name || f.title || '(no name field; keys=' + Object.keys(f).join(',') + ')');
+    } catch (e) {
+      debug.formsError = String(e.message || e);
+    }
 
-    // 2) Resolve user names (same pagination as the time-clock handler).
+    const targets = TARGET_FORMS.map(norm);
+    const wanted = (Array.isArray(allForms) ? allForms : []).filter(f => {
+      const n = norm(f.name || f.title);
+      return targets.some(t => n === t || n.includes(t) || t.includes(n));
+    });
+    debug.matchedNames = wanted.map(f => f.name || f.title);
+
+    // 2) Resolve user names.
     const userMap = {};
     try {
       const LIMIT = 200; let offset = 0; let page = 0;
@@ -55,39 +66,33 @@ export default async function handler(req, res) {
         const u = await connecteamFetch('/users/v1/users', { limit: LIMIT, offset });
         const users = u?.data?.users || [];
         if (!Array.isArray(users) || users.length === 0) break;
-        users.forEach(usr => {
-          const uid = usr.userId || usr.id; if (!uid) return;
-          userMap[uid] = `${usr.firstName || ''} ${usr.lastName || ''}`.trim() || usr.email || `User ${uid}`;
-        });
+        users.forEach(usr => { const uid = usr.userId || usr.id; if (uid) userMap[uid] = `${usr.firstName || ''} ${usr.lastName || ''}`.trim() || usr.email || `User ${uid}`; });
         const next = u?.paging?.offset;
         if (typeof next !== 'number' || users.length < LIMIT) break;
         offset = next; page++;
       }
-    } catch (e) { console.error('user resolve failed', e.message); }
+    } catch (e) { debug.usersError = String(e.message || e); }
 
-    // 3) For each matched form: question titles + submissions, normalized.
+    // 3) Submissions per matched form.
     const submissions = [];
     for (const form of wanted) {
       const formId = form.id || form.formId;
       if (!formId) continue;
-
       const qMap = {};
       try {
         const def = await connecteamFetch(`/forms/v1/forms/${formId}`);
         const questions = def?.data?.form?.questions || def?.data?.questions || def?.data?.form?.fields || [];
-        (Array.isArray(questions) ? questions : []).forEach(q => {
-          const qid = q.questionId || q.id; if (qid != null) qMap[qid] = q.title || q.label || q.name || String(qid);
-        });
-      } catch (e) { console.error('form def failed', formId, e.message); }
+        (Array.isArray(questions) ? questions : []).forEach(q => { const qid = q.questionId || q.id; if (qid != null) qMap[qid] = q.title || q.label || q.name || String(qid); });
+      } catch (e) { debug['formDefError_' + formId] = String(e.message || e); }
 
       let offset = 0; let page = 0;
       while (page < 25) {
         let subsRes;
         try { subsRes = await connecteamFetch(`/forms/v1/forms/${formId}/form-submissions`, { limit: 100, offset }); }
-        catch (e) { console.error('submissions fetch failed', formId, e.message); break; }
+        catch (e) { debug['subsError_' + formId] = String(e.message || e); break; }
         const subs = subsRes?.data?.formSubmissions || subsRes?.data?.submissions || subsRes?.data || [];
+        if (!debug.sampleSubmissionKeys && Array.isArray(subs) && subs[0]) debug.sampleSubmissionKeys = Object.keys(subs[0]);
         if (!Array.isArray(subs) || subs.length === 0) break;
-
         subs.forEach(s => {
           const id = s.formSubmissionId || s.id || s.submissionId;
           const ts = s.submissionTimestamp || s.timestamp || s.createdAt;
@@ -99,32 +104,23 @@ export default async function handler(req, res) {
             question: qMap[a.questionId || a.id] || a.title || a.question || a.label || String(a.questionId ?? ''),
             answer: answerValue(a),
           })).filter(qa => qa.answer !== '');
-          submissions.push({
-            id,
-            form: form.name || form.title,
-            submittedAt: submittedAt || new Date().toISOString(),
-            user: userMap[userId] || (userId ? `User ${userId}` : 'Level 1'),
-            answers,
-            raw: s,
-          });
+          submissions.push({ id, form: form.name || form.title, submittedAt: submittedAt || new Date().toISOString(), user: userMap[userId] || (userId ? `User ${userId}` : 'Level 1'), answers, raw: s });
         });
-
         const next = subsRes?.paging?.offset;
         if (typeof next !== 'number' || subs.length < 100) break;
         offset = next; page++;
       }
     }
 
-    res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=300');
     res.setHeader('Access-Control-Allow-Origin', '*');
     return res.status(200).json({
       success: true,
       formsMatched: wanted.map(f => ({ id: f.id || f.formId, name: f.name || f.title })),
       submissions,
+      debug,
       fetchedAt: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('supply-requests proxy error:', err);
-    return res.status(500).json({ error: 'Failed to fetch Connecteam forms', message: err.message });
+    return res.status(500).json({ error: 'Failed', message: err.message, debug });
   }
 }
