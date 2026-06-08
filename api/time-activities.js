@@ -6,7 +6,7 @@ async function connecteamFetch(path, params = {}) {
   const url = new URL(CONNECTEAM_API + path);
   Object.entries(params).forEach(([k, v]) => { if (v) url.searchParams.set(k, v); });
   const res = await fetch(url.toString(), {
-    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' }
+    headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' }
   });
   if (!res.ok) { const text = await res.text(); throw new Error('Connecteam API ' + res.status + ': ' + text); }
   return res.json();
